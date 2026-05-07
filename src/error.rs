@@ -13,6 +13,10 @@ pub enum CosError {
     #[error("JSON serialization/deserialization failed: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// xml 序列化/反序列化错误
+    #[error("JSON serialization/deserialization failed: {0}")]
+    Xml(#[from] quick_xml::DeError),
+
     /// URL 解析错误
     #[error("URL parsing failed: {0}")]
     Url(#[from] url::ParseError),

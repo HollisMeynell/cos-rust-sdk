@@ -315,6 +315,105 @@ impl ObjectClient {
             Err(e) => Err(e),
         }
     }
+
+    async fn init_multipart_upload(&self, key: &str) -> Result<InitiateMultipartUploadResult> {
+        let mut params = HashMap::new();
+        params.insert("uploads".to_string(), "".to_string());
+        let resp = self.client.post(&format!("/{}", key), params, None::<Vec<u8>>).await?;
+        let body = resp.text().await?;
+        let result: InitiateMultipartUploadResult = quick_xml::de::from_str(&body)?;
+        Ok(result)
+    }
+
+    /// 开始分段上传
+    pub async fn multipart_upload<F>(
+        &self,
+        key: &str,
+        file_path: &Path,
+        chunk_size: usize,
+        mut on_progress: F,
+    ) -> Result<String>
+    where
+        F: FnMut(u64, u64) + Send,
+    {
+        use tokio::fs::File;
+        use tokio::io::AsyncReadExt;
+
+        let init = self.init_multipart_upload(key).await?;
+        let upload_id = init.upload_id;
+
+        let mut file = File::open(file_path).await?;
+        let file_size = file.metadata().await?.len();
+
+        let mut uploaded: u64 = 0;
+        let mut part_number: i32 = 1;
+
+        let mut etags: Vec<(i32, String)> = Vec::new();
+
+        let mut buffer = vec![0u8; chunk_size];
+
+        loop {
+            let read_size = file.read(&mut buffer).await?;
+
+            if read_size == 0 {
+                break;
+            }
+
+            let data = buffer[..read_size].to_vec();
+
+            let path = format!("/{}?partNumber={}&uploadId={}", key, part_number, upload_id);
+
+            let resp = self.client.put(&path, HashMap::new(), Some(data)).await?;
+
+            if !resp.status().is_success() {
+                let code = resp.status().to_string();
+                let message = resp.text().await.unwrap_or_default();
+                return Err(CosError::Client { code, message });
+            }
+
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            etags.push((part_number, etag));
+
+            uploaded += read_size as u64;
+            part_number += 1;
+
+            on_progress(uploaded, file_size);
+        }
+
+        let request = CompleteMultipartUpload {
+            parts: etags
+                .into_iter()
+                .map(|(part, etag)| Part {
+                    part_number: part,
+                    etag,
+                })
+                .collect(),
+        };
+        let xml = quick_xml::se::to_string(&request)?;
+
+        let resp = self
+            .client
+            .post(
+                &format!("/{}?uploadId={}", key, upload_id),
+                HashMap::new(),
+                Some(xml.into_bytes()),
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            let code = resp.status().to_string();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(CosError::Client { code, message });
+        }
+
+        Ok(upload_id)
+    }
 }
 
 /// 上传对象响应
@@ -399,6 +498,38 @@ pub struct DeleteError {
     pub code: String,
     #[serde(rename = "Message")]
     pub message: String,
+}
+
+/// 开启分段上传的响应
+#[derive(Debug, Deserialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+pub struct InitiateMultipartUploadResult {
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+
+    #[serde(rename = "Key")]
+    pub key: String,
+
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+}
+
+/// 切片
+#[derive(Debug, Serialize)]
+#[serde(rename = "CompleteMultipartUpload")]
+pub struct CompleteMultipartUpload {
+    #[serde(rename = "Part")]
+    pub parts: Vec<Part>,
+}
+
+/// 切片信息
+#[derive(Debug, Serialize)]
+pub struct Part {
+    #[serde(rename = "PartNumber")]
+    pub part_number: i32,
+
+    #[serde(rename = "ETag")]
+    pub etag: String,
 }
 
 #[cfg(test)]
